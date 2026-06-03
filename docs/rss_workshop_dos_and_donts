@@ -1,0 +1,171 @@
+# Realistic Cheap-LiDAR for RL: Execution Pipeline
+
+## 0. The Idea
+Fit parametric sensor-corruption models from real RPLidar data. Inject them as a post-processing layer on ideal MuJoCo raycasts. Train PPO policies with this corrupted lidar. Show that policies trained on corrupted lidar crash less into real glass than policies trained on clean lidar.
+
+---
+
+## 1. Data Collection Pipeline
+
+**Hardware locked**: RPLidar A2 or A3, TurtleBot3 or tripod, measuring tape, OptiTrack (if available).
+
+| Stage | Input | Procedure | Output File |
+|---|---|---|---|
+| S1.1 | Flat white wall, measuring tape | Record 100 scans each at 0.5/1.0/1.5/2.0/3.0/4.0/5.0 m, perpendicular. Repeat at 15°/30°/45° for 1.0/2.0/3.0 m. | `s1_range_wall.h5` |
+| S1.2 | Glass panel + wall behind it | Record 100 scans: no glass (baseline), then glass at 0.5/1.0/1.5/2.0 m. Repeat at 10°/20° tilt. Repeat with smudged and misted glass. | `s2_glass_dropout.h5` |
+| S1.3 | Black foam board, gray card, white poster | Record 100 scans each at 1.5/2.0/3.0/4.0 m, perpendicular. | `s3_dark_surface.h5` |
+| S1.4 | Corridor, OptiTrack markers | Static: 200 scans stationary. Motion: 30 s continuous recording at 0.1/0.2/0.4 m/s straight, and 30°/60°/s rotation. | `s4_motion_distortion.bag` |
+| S1.5 | Single thin pole, empty room | 500 scans, robot completely stationary. | `s5_jitter.h5` |
+
+**Synchronization requirement**: Every scan must carry a UNIX timestamp. OptiTrack (if used) must log at ≥100 Hz with matching timestamps.
+
+---
+
+## 2. Model Fitting Pipeline
+
+Run these in order. Each script reads the corresponding `.h5`/`.bag` and writes a JSON config.
+
+| Script | Input | Model | Output |
+|---|---|---|---|
+| `fit_range_noise.py` | `s1_range_wall.h5` | Robust linear regression: `sigma(r,theta) = a + b*r + c*theta`, `bias(r,theta) = d + e*r + f*theta` | `range_model.json` |
+| `fit_dropout.py` | `s2_glass_dropout.h5` + `s3_dark_surface.h5` | Logistic regression per material class: `p_drop(material, r) = logistic(alpha_m + beta_m * r)` | `dropout_model.json` |
+| `fit_motion.py` | `s4_motion_distortion.bag` + OptiTrack logs | Compute `T_scan` from scan timestamps. Compute per-beam pose by interpolating OptiTrack at `t_i = t_start + (i/N)*T_scan`. Fit distortion magnitude vs. velocity. | `motion_model.json` |
+| `fit_jitter.py` | `s5_jitter.h5` | Compute std of detected pole angle across scans. Compute beam-spacing histogram. | `jitter_model.json` |
+
+**Final merged artifact**: `sensor_config.json` combining all four model outputs.
+
+---
+
+## 3. Simulator Corruption Pipeline
+
+**Simulator locked**: MuJoCo.
+
+Architecture: ideal raycast output → sequential post-processing modules → corrupted ranges → RL policy.
+
+| Module | What it does | Parameters from |
+|---|---|---|
+| Motion Distortion | For beam `i`, compute firing time `t_i`. Interpolate robot pose at `t_i` from a pose ring buffer. Fire ray from that pose, not the current pose. | `motion_model.json` |
+| Angular Jitter | Add Gaussian perturbation to azimuth before ray direction is computed. | `jitter_model.json` |
+| Range Noise + Bias | Apply material/distance/angle-dependent Gaussian to returned range. | `range_model.json` |
+| Dropout | Draw Bernoulli sample. If true, replace range with NaN. | `dropout_model.json` |
+| Quantization | Round range to sensor native resolution (e.g., 1 mm). | Hardcoded per sensor spec |
+
+**Output of this stage**: A `CheapLidar` class inside your MuJoCo environment that returns corrupted scans indistinguishable from real RPLidar behavior for the modeled failure modes.
+
+---
+
+## 4. RL Training Pipeline
+
+**Algorithm locked**: PPO (Stable-Baselines3). **Observation**: 36 downsampled ranges + goal distance/angle + last action. **Action**: `[linear_vel, angular_vel]`. **Task**: 2D goal-reaching with box obstacles and one glass obstacle.
+
+| Condition | Raycast Source | Corruption Applied? | Domain Randomization | Purpose |
+|---|---|---|---|---|
+| A - Ideal | MuJoCo `mj_ray` | None | None | Baseline |
+| B - Naive-DR | MuJoCo `mj_ray` | None | Uniform noise ±30% on ranges, random dropout 0-10% | Test if blind randomization helps |
+| C - Realistic-Static | MuJoCo `mj_ray` | Full pipeline with nominal `sensor_config.json` parameters | None | Test if calibration alone helps |
+| D - Realistic+DR | MuJoCo `mj_ray` | Full pipeline | Per-episode sampling: `sigma_0 * U(0.7,1.3)`, `alpha_m * U(0.8,1.2)`, `T_scan * U(0.95,1.05)` | Test calibrated randomization |
+
+**Training output**: Four `.zip` policy checkpoints (A, B, C, D), each trained for 5M timesteps with 3-5 random seeds. Logged to TensorBoard.
+
+---
+
+## 5. Evaluation Pipeline
+
+### Simulation Evaluation
+- **Test maps**: 5 held-out mazes. 2 contain glass obstacles.
+- **Metrics**: Success rate, collision rate, glass-collision rate, time-to-goal.
+- **Output**: `sim_results.csv` with rows: `[condition, seed, map_id, success, collision, glass_hit, time]`.
+
+### Real-World Evaluation (if time permits)
+- **Environment**: Lab corridor with acrylic panel placed as transparent obstacle.
+- **Procedure**: Deploy checkpoint D (Realistic+DR) and checkpoint A (Ideal). Run 5 episodes each, randomized start/goal.
+- **Metrics**: Success, collision, specifically "panel collision" counted manually from video.
+- **Output**: `real_results.csv` with rows: `[condition, episode, success, collision, panel_hit]`.
+
+---
+
+## 6. Paper Pipeline
+
+### Workshop Submission (RSS 2026, ~June 21)
+**Target**: Data-Centric Robotics or Reliable Robotics workshop.
+
+| Section | Content | Approx. Length |
+|---|---|---|
+| Abstract | Gap + method + preliminary result | 150 words |
+| Introduction | RL nav uses ideal lidar. AV sim is perception-only. Missing: cheap-lidar corruption in RL. | 0.75 pages |
+| Related Work | LiDARsim/RINet (perception). Mapless DRL (ideal sensors). MEMS sim (SLAM). No RL+cheap-lidar work. | 0.75 pages |
+| Method | Data collection scenes. Fitted models. MuJoCo pipeline. DR strategy. | 2 pages |
+| Experiments | Training curves (A vs D). Sim eval on glass maps. Optional real panel test table. | 1.5 pages |
+| Discussion | Motion distortion had largest impact. DR alone (B) insufficient. Realism+DR (D) best. | 0.5 pages |
+| Future Work | Fog, Livox, Gazebo/Isaac, multi-building eval. | 0.25 pages |
+
+**Companion assets**: GitHub repo link, 30-second video (optional), `sensor_config.json` in supplementary.
+
+### Journal Extension (RA-L / CoRL / T-RO, 3-6 months later)
+
+Add to the workshop foundation:
+
+| Addition | Work | Output |
+|---|---|---|
+| 6 more failure modes | Scenes 5-9 data collection + fitting | Expanded `sensor_config.json` |
+| 2 more sensors | YDLidar X4 and Livox MID-360 data collection + model fitting | `sensor_config_ydlidar.json`, `sensor_config_livox.json` |
+| Gazebo plugin | C++ ROS 2 node subscribing to `/scan`, applying corruption, republishing | `gazebo_lidar_corruptor` package |
+| Isaac Sim node | OmniGraph post-processing node after RTX Lidar | `isaac_cheap_lidar` extension |
+| 2 more RL algorithms | SAC and DreamerV3 training | Additional checkpoints |
+| Multi-building eval | Deploy to Building A (lab), Building B (different floor), Building C (adverse scene) | `real_building_abc.csv` |
+| Full ablation study | Remove one corruption module at a time from D. Train and evaluate. | `ablation_results.csv` |
+
+---
+
+## 7. Deliverables & Filenames
+
+### Workshop (Week 4)
+- `rplidar-rl-sim/` (GitHub repo)
+  - `calibration/fit_range_noise.py`
+  - `calibration/fit_dropout.py`
+  - `calibration/fit_motion.py`
+  - `calibration/fit_jitter.py`
+  - `calibration/sensor_config.json`
+  - `envs/cheap_lidar.py` (MuJoCo sensor class, no code in this doc but file must exist)
+  - `envs/navigation_env.py` (MuJoCo RL env)
+  - `train/train_ppo.py`
+  - `data/s1_range_wall.h5`
+  - `data/s2_glass_dropout.h5`
+  - `data/s3_dark_surface.h5`
+  - `checkpoints/ideal.zip`
+  - `checkpoints/realistic_dr.zip`
+  - `results/sim_results.csv`
+  - `paper/rss2026_workshop.pdf`
+
+### Journal (Month 6)
+- Expanded repo with Gazebo + Isaac folders
+- `data/s4_s9_complete.h5`
+- `results/ablation_results.csv`
+- `results/cross_sensor_transfer.csv`
+- `paper/journal.pdf`
+- Supplementary video (5 min)
+
+---
+
+## 8. 4-Week Sprint Calendar
+
+| Week | Dates | Tasks | Deliverable Files |
+|---|---|---|---|
+| **W1** | May 20-26 | Build scenes. Record S1-S3. Run fit scripts. Validate JSON. | `s1_*.h5`, `s2_*.h5`, `s3_*.h5`, `range_model.json`, `dropout_model.json` |
+| **W2** | May 27-Jun 2 | Build MuJoCo env. Integrate `CheapLidar` class. Load `sensor_config.json`. Generate side-by-side scan plots (real vs. simulated). | `cheap_lidar.py`, `demo_plot.png`, `sensor_config.json` (final) |
+| **W3** | Jun 3-9 | Train A and D. Evaluate on held-out maps. | `ideal.zip`, `realistic_dr.zip`, `sim_results.csv` |
+| **W4** | Jun 10-16 | If time: real acrylic panel test. Write paper. | `real_results.csv` (optional), `rss2026_workshop.pdf` |
+| **Buffer** | Jun 17-20 | Video recording. Final figure polish. Submit. | GitHub release, submission confirmation |
+
+---
+
+## 9. Decision Log (Locked)
+
+| Decision | Choice | Rationale |
+|---|---|---|
+| Simulator | MuJoCo | Fastest Python iteration for RL |
+| Sensor | RPLidar A2/A3 | Most common cheap 2D lidar |
+| Failure modes (workshop) | Range noise, glass dropout, motion distortion | Cover geometric + material + temporal |
+| RL algo | PPO | Stable baseline; sensor is the variable |
+| DR strategy | Uniform sampling around fitted params per episode | Simple, effective, no extra learning |
+| Real-world eval (workshop) | Optional 1-day acrylic panel test | Workshop accepts sim-heavy; real is bonus |
